@@ -9,6 +9,7 @@ mod input_ownership;
 mod keyboard;
 mod mouse;
 mod rawinput;
+mod sequence_matcher;
 mod signal;
 mod state;
 mod tray;
@@ -26,8 +27,12 @@ use keyboard::KeyboardHook;
 use mouse::MouseHook;
 use state::AppState;
 use tray::TrayIcon;
+use windows::Win32::Media::timeBeginPeriod;
 
 fn main() -> Result<()> {
+    // Request 1ms timer resolution for precise timing in input processing
+    unsafe { timeBeginPeriod(1) };
+
     signal::set_control_ctrl_handler()?;
 
     // Load config or create default if not exists
@@ -46,6 +51,7 @@ fn main() -> Result<()> {
             return show_error(&error_msg);
         }
     });
+    app_state.refresh_key_repeat_settings();
 
     // Start keyboard hook in a separate thread BEFORE GUI
     // Create hook INSIDE the thread to ensure proper message loop
@@ -82,18 +88,13 @@ fn main() -> Result<()> {
     if app_state.show_tray_icon() {
         let tray_state = app_state.clone();
         thread::spawn(move || {
-            match TrayIcon::new(tray_state.should_exit.clone()) {
-                Ok(mut tray) => {
-                    let language = tray_state.language();
-                    let translations = crate::i18n::CachedTranslations::new(language);
-                    let msg = translations.tray_notification_launched().to_string();
-                    let _ = tray.show_info(&msg);
-                    let _ = tray.run_message_loop();
-                }
-                Err(e) => {
-                    eprintln!("Failed to create tray icon: {}", e);
-                }
-            }
+            let mut tray =
+                TrayIcon::new(tray_state.should_exit.clone()).expect("Failed to create tray icon");
+            let language = tray_state.language();
+            let translations = crate::i18n::CachedTranslations::new(language);
+            let msg = translations.tray_notification_launched().to_string();
+            let _ = tray.show_info(&msg);
+            let _ = tray.run_message_loop();
         });
     }
 

@@ -2,11 +2,11 @@
 
 use crate::gui::SorahkGui;
 use crate::gui::about_dialog::render_about_dialog;
+use crate::gui::utils::{is_mouse_move_target, is_mouse_scroll_target};
+use crate::gui::theme;
+use crate::gui::widgets::{arrow_separator_width, estimate_pill_width_display};
 use crate::state::NotificationEvent;
 use eframe::egui;
-use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, SetForegroundWindow, ShowWindow, SW_HIDE, SW_SHOW,
-};
 
 /// Cached frame state to avoid repeated atomic operations.
 struct FrameState {
@@ -120,29 +120,15 @@ impl eframe::App for SorahkGui {
         }
 
         // Apply cached visuals based on theme
-        let visuals = if self.dark_mode {
-            &self.cached_dark_visuals
-        } else {
-            &self.cached_light_visuals
-        };
-        ctx.set_visuals(visuals.clone());
+        ctx.set_visuals(self.theme_cache.visuals(self.dark_mode).clone());
 
-        ctx.request_repaint();
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
         // Handle window visibility requests
         if self.app_state.check_and_clear_show_window_request() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            // Direct Win32 restore for reliability
-            unsafe {
-                if let Ok(hwnd) =
-                    FindWindowW(None, windows::core::w!("Sorahk - Auto Key Press Tool"))
-                {
-                    let _ = ShowWindow(hwnd, SW_SHOW);
-                    let _ = SetForegroundWindow(hwnd);
-                }
-            }
         }
 
         if self.app_state.check_and_clear_show_about_request() {
@@ -171,6 +157,10 @@ impl eframe::App for SorahkGui {
             if self.device_manager_dialog.is_none() {
                 let mut dialog = crate::gui::device_manager_dialog::DeviceManagerDialog::new();
                 dialog.load_preferences(&self.config.device_api_preferences);
+                dialog.load_xinput_params(
+                    self.config.xinput_stick_deadzone,
+                    self.config.xinput_trigger_threshold,
+                );
                 dialog.refresh_devices();
                 self.device_manager_dialog = Some(dialog);
             }
@@ -236,7 +226,25 @@ impl eframe::App for SorahkGui {
                     dialog.refresh_devices();
                 }
 
+                // Push every slider movement into `AppState` so the change
+                // takes effect on the next XInput poll tick. The config save
+                // is batched to the dialog-close event below to avoid
+                // rewriting `Config.toml` on every drag frame.
+                if let Some((stick_deadzone, trigger_threshold)) =
+                    dialog.take_xinput_params_change()
+                {
+                    self.config.xinput_stick_deadzone = stick_deadzone;
+                    self.config.xinput_trigger_threshold = trigger_threshold;
+                    self.app_state
+                        .set_xinput_thresholds(stick_deadzone, trigger_threshold);
+                    self.xinput_params_save_pending = true;
+                }
+
                 if should_close {
+                    if self.xinput_params_save_pending {
+                        let _ = self.config.save_to_file("Config.toml");
+                        self.xinput_params_save_pending = false;
+                    }
                     self.show_device_manager = false;
                     self.device_manager_dialog = None;
                 }
@@ -267,6 +275,42 @@ impl eframe::App for SorahkGui {
                 }
                 self.mouse_direction_dialog = None;
                 self.mouse_direction_mapping_idx = None;
+            }
+        }
+
+        // Handle rule properties dialog (aka "Mapping Add-ons")
+        if let Some(dialog) = &mut self.rule_properties_dialog {
+            let should_close = dialog.render(ctx, self.dark_mode, &self.translations);
+            if should_close {
+                if let Some(result) = dialog.take_result() {
+                    if let Some(idx) = self.rule_props_editing_idx {
+                        // Existing mapping path: write straight into the
+                        // mapping held inside the draft config.
+                        if let Some(temp_config) = &mut self.temp_config
+                            && let Some(mapping) = temp_config.mappings.get_mut(idx)
+                        {
+                            mapping.hold_indices = if result.hold_indices.is_empty() {
+                                None
+                            } else {
+                                Some(result.hold_indices)
+                            };
+                            mapping.append_keys = if result.append_keys.is_empty() {
+                                None
+                            } else {
+                                Some(result.append_keys)
+                            };
+                        }
+                    } else {
+                        // New-mapping path: park the result in the GUI's
+                        // transient fields. The settings dialog's Add
+                        // button flushes them into the KeyMapping when
+                        // the draft is committed.
+                        self.new_mapping_hold_indices = result.hold_indices.into_iter().collect();
+                        self.new_mapping_append_keys = result.append_keys.into_iter().collect();
+                    }
+                }
+                self.rule_properties_dialog = None;
+                self.rule_props_editing_idx = None;
             }
         }
 
@@ -330,7 +374,7 @@ impl SorahkGui {
                 } else {
                     self.dialog_highlight_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    ctx.request_repaint();
                 }
             }
         }
@@ -352,11 +396,8 @@ impl SorahkGui {
             ctx.request_repaint();
         }
 
-        let dialog_bg = if self.dark_mode {
-            egui::Color32::from_rgb(30, 32, 42)
-        } else {
-            egui::Color32::from_rgb(252, 248, 255)
-        };
+        let c = theme::colors(self.dark_mode);
+        let dialog_bg = c.bg_card;
 
         let window = egui::Window::new("")
             .title_bar(false)
@@ -377,7 +418,7 @@ impl SorahkGui {
                         offset: [0, 4],
                         blur: 10,
                         spread: 2,
-                        color: egui::Color32::from_rgba_premultiplied(0, 0, 0, 40),
+                        color: theme::overlay::SHADOW_HEAVY,
                     }),
             );
 
@@ -389,11 +430,7 @@ impl SorahkGui {
                     egui::RichText::new(t.close_window_title())
                         .size(22.0)
                         .strong()
-                        .color(if self.dark_mode {
-                            egui::Color32::from_rgb(255, 182, 193)
-                        } else {
-                            egui::Color32::from_rgb(219, 112, 147)
-                        }),
+                        .color(c.accent_pink),
                 );
 
                 ui.add_space(8.0);
@@ -401,11 +438,7 @@ impl SorahkGui {
                     egui::RichText::new(t.close_subtitle())
                         .size(13.0)
                         .italics()
-                        .color(if self.dark_mode {
-                            egui::Color32::from_rgb(180, 180, 180)
-                        } else {
-                            egui::Color32::from_rgb(120, 120, 120)
-                        }),
+                        .color(c.fg_muted),
                 );
 
                 ui.add_space(30.0);
@@ -421,11 +454,7 @@ impl SorahkGui {
                             .color(egui::Color32::WHITE)
                             .strong(),
                     )
-                    .fill(if self.dark_mode {
-                        egui::Color32::from_rgb(180, 160, 230)
-                    } else {
-                        egui::Color32::from_rgb(210, 190, 240)
-                    })
+                    .fill(theme::colors(self.dark_mode).accent_primary)
                     .corner_radius(15.0);
 
                     if ui
@@ -433,13 +462,7 @@ impl SorahkGui {
                         .clicked()
                     {
                         self.show_close_dialog = false;
-                        unsafe {
-                            if let Ok(hwnd) =
-                                FindWindowW(None, windows::core::w!("Sorahk - Auto Key Press Tool"))
-                            {
-                                let _ = ShowWindow(hwnd, SW_HIDE);
-                            }
-                        }
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                     }
 
                     ui.add_space(12.0);
@@ -451,11 +474,7 @@ impl SorahkGui {
                         .color(egui::Color32::WHITE)
                         .strong(),
                 )
-                .fill(if self.dark_mode {
-                    egui::Color32::from_rgb(220, 180, 210)
-                } else {
-                    egui::Color32::from_rgb(230, 200, 220)
-                })
+                .fill(theme::colors(self.dark_mode).accent_danger)
                 .corner_radius(15.0);
 
                 if ui
@@ -471,17 +490,9 @@ impl SorahkGui {
                 let cancel_btn = egui::Button::new(
                     egui::RichText::new(t.cancel_close_button())
                         .size(13.0)
-                        .color(if self.dark_mode {
-                            egui::Color32::from_rgb(200, 200, 200)
-                        } else {
-                            egui::Color32::from_rgb(80, 80, 80)
-                        }),
+                        .color(egui::Color32::WHITE),
                 )
-                .fill(if self.dark_mode {
-                    egui::Color32::from_rgb(60, 60, 60)
-                } else {
-                    egui::Color32::from_rgb(230, 230, 230)
-                })
+                .fill(theme::colors(self.dark_mode).accent_secondary)
                 .corner_radius(10.0);
 
                 if ui
@@ -567,11 +578,7 @@ impl SorahkGui {
 
     /// Renders the main content panel with all UI components.
     fn render_main_content(&mut self, ctx: &egui::Context, frame_state: &FrameState) {
-        let panel_bg = if self.dark_mode {
-            egui::Color32::from_rgb(30, 32, 42)
-        } else {
-            egui::Color32::from_rgb(252, 248, 255)
-        };
+        let panel_bg = theme::colors(self.dark_mode).bg_card;
 
         egui::CentralPanel::default()
             .frame(
@@ -604,6 +611,7 @@ impl SorahkGui {
     /// Renders the title bar with theme toggle and menu buttons.
     fn render_title_bar(&mut self, ui: &mut egui::Ui) {
         let t = &self.translations;
+        let c = theme::colors(self.dark_mode);
 
         ui.horizontal(|ui| {
             ui.add_space(15.0);
@@ -612,54 +620,8 @@ impl SorahkGui {
                 egui::RichText::new(t.app_title())
                     .size(18.0)
                     .strong()
-                    .color(if self.dark_mode {
-                        egui::Color32::from_rgb(176, 224, 230)
-                    } else {
-                        egui::Color32::from_rgb(135, 206, 235)
-                    }),
+                    .color(c.title_primary),
             );
-
-            // Preset quick-switch dropdown in title bar
-            if !self.config.presets.is_empty() {
-                ui.add_space(12.0);
-                let current_name = if self.config.current_preset.is_empty() {
-                    t.no_preset().to_string()
-                } else {
-                    self.config.current_preset.clone()
-                };
-                let previous_preset = self.config.current_preset.clone();
-                let previous_mapping_count = self.config.mappings.len();
-                egui::ComboBox::from_id_salt("titlebar_preset_selector")
-                    .selected_text(&current_name)
-                    .width(120.0)
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_label(self.config.current_preset.is_empty(), t.no_preset()).clicked() {
-                            self.config.current_preset.clear();
-                            self.config.mappings.clear();
-                        }
-                        for preset in &self.config.presets.clone() {
-                            let is_selected = self.config.current_preset == preset.name;
-                            if ui.selectable_label(is_selected, &preset.name).clicked() {
-                                self.config.current_preset = preset.name.clone();
-                                self.config.mappings = preset.mappings.clone();
-                            }
-                        }
-                    });
-                if previous_preset != self.config.current_preset
-                    || previous_mapping_count != self.config.mappings.len()
-                {
-                    if let Err(e) = self.config.save_to_file("Config.toml") {
-                        eprintln!("Failed to save preset switch: {}", e);
-                    }
-                    if let Err(e) = self.app_state.reload_config(self.config.clone()) {
-                        eprintln!("Failed to reload config after preset switch: {}", e);
-                    }
-                    if let Some(temp_config) = &mut self.temp_config {
-                        temp_config.current_preset = self.config.current_preset.clone();
-                        temp_config.presets = self.config.presets.clone();
-                    }
-                }
-            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(10.0);
@@ -698,7 +660,7 @@ impl SorahkGui {
                         .size(13.0)
                         .color(egui::Color32::WHITE),
                 )
-                .fill(egui::Color32::from_rgb(135, 206, 235))
+                .fill(theme::colors(self.dark_mode).accent_primary)
                 .corner_radius(12.0);
 
                 if ui.add(settings_btn).clicked() {
@@ -713,8 +675,6 @@ impl SorahkGui {
 
                     self.show_settings_dialog = true;
                     self.temp_config = Some(self.config.clone());
-                    self.preset_rename_target.clear();
-                    self.preset_rename_input.clear();
                 }
 
                 ui.add_space(8.0);
@@ -724,7 +684,7 @@ impl SorahkGui {
                         .size(13.0)
                         .color(egui::Color32::WHITE),
                 )
-                .fill(egui::Color32::from_rgb(152, 181, 226))
+                .fill(theme::colors(self.dark_mode).accent_success)
                 .corner_radius(12.0);
 
                 if ui.add(device_manager_btn).clicked() {
@@ -738,7 +698,7 @@ impl SorahkGui {
                         .size(13.0)
                         .color(egui::Color32::WHITE),
                 )
-                .fill(egui::Color32::from_rgb(216, 191, 216))
+                .fill(theme::colors(self.dark_mode).accent_secondary)
                 .corner_radius(12.0);
 
                 if ui.add(about_btn).clicked() {
@@ -751,11 +711,8 @@ impl SorahkGui {
     /// Renders the status card with pause/resume and exit controls.
     fn render_status_card(&mut self, ui: &mut egui::Ui, frame_state: &FrameState) {
         let t = &self.translations;
-        let card_bg = if self.dark_mode {
-            egui::Color32::from_rgb(40, 42, 50)
-        } else {
-            egui::Color32::from_rgb(245, 238, 252)
-        };
+        let c = theme::colors(self.dark_mode);
+        let card_bg = c.bg_card_hover;
 
         egui::Frame::NONE
             .fill(card_bg)
@@ -769,23 +726,15 @@ impl SorahkGui {
                         egui::RichText::new(t.status_title())
                             .size(16.0)
                             .strong()
-                            .color(if self.dark_mode {
-                                egui::Color32::from_rgb(200, 180, 255)
-                            } else {
-                                egui::Color32::from_rgb(150, 100, 200)
-                            }),
+                            .color(c.accent_secondary),
                     );
 
                     ui.add_space(10.0);
 
                     let (icon, text, color) = if frame_state.is_paused {
-                        ("⏸", t.paused_status(), egui::Color32::from_rgb(255, 140, 0))
+                        ("⏸", t.paused_status(), c.status_paused)
                     } else {
-                        (
-                            "▶",
-                            t.running_status(),
-                            egui::Color32::from_rgb(34, 139, 34),
-                        )
+                        ("▶", t.running_status(), c.status_active)
                     };
 
                     ui.label(egui::RichText::new(icon).size(18.0).color(color));
@@ -798,11 +747,7 @@ impl SorahkGui {
                                     t.format_worker_count(frame_state.worker_count),
                                 )
                                 .size(13.0)
-                                .color(if self.dark_mode {
-                                    egui::Color32::from_rgb(135, 206, 235)
-                                } else {
-                                    egui::Color32::from_rgb(70, 130, 180)
-                                }),
+                                .color(c.accent_primary),
                             );
                         }
                     });
@@ -815,23 +760,9 @@ impl SorahkGui {
                     let height = 32.0;
 
                     let (text, color) = if frame_state.is_paused {
-                        (
-                            t.start_button(),
-                            if self.dark_mode {
-                                egui::Color32::from_rgb(120, 220, 140)
-                            } else {
-                                egui::Color32::from_rgb(140, 230, 150)
-                            },
-                        )
+                        (t.start_button(), c.accent_success)
                     } else {
-                        (
-                            t.pause_button(),
-                            if self.dark_mode {
-                                egui::Color32::from_rgb(255, 200, 130)
-                            } else {
-                                egui::Color32::from_rgb(255, 215, 170)
-                            },
-                        )
+                        (t.pause_button(), c.accent_warning)
                     };
 
                     let toggle_btn = egui::Button::new(
@@ -863,11 +794,7 @@ impl SorahkGui {
                             .color(egui::Color32::WHITE)
                             .strong(),
                     )
-                    .fill(if self.dark_mode {
-                        egui::Color32::from_rgb(220, 180, 210)
-                    } else {
-                        egui::Color32::from_rgb(230, 200, 220)
-                    })
+                    .fill(theme::colors(self.dark_mode).accent_danger)
                     .corner_radius(15.0);
 
                     if ui.add_sized([width, height], exit_btn).clicked() {
@@ -881,11 +808,8 @@ impl SorahkGui {
     /// Renders the hotkey settings card displaying the toggle key.
     fn render_hotkey_card(&self, ui: &mut egui::Ui) {
         let t = &self.translations;
-        let card_bg = if self.dark_mode {
-            egui::Color32::from_rgb(40, 42, 50)
-        } else {
-            egui::Color32::from_rgb(245, 238, 252)
-        };
+        let c = theme::colors(self.dark_mode);
+        let card_bg = c.bg_card_hover;
 
         egui::Frame::NONE
             .fill(card_bg)
@@ -898,31 +822,21 @@ impl SorahkGui {
                     egui::RichText::new(t.hotkey_settings_title())
                         .size(16.0)
                         .strong()
-                        .color(if self.dark_mode {
-                            egui::Color32::from_rgb(200, 180, 255)
-                        } else {
-                            egui::Color32::from_rgb(100, 120, 200)
-                        }),
+                        .color(c.accent_secondary),
                 );
 
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(t.toggle_key_label()).size(14.0).color(
-                        if self.dark_mode {
-                            egui::Color32::from_rgb(200, 200, 200)
-                        } else {
-                            egui::Color32::from_rgb(40, 40, 40)
-                        },
-                    ));
+                    ui.label(
+                        egui::RichText::new(t.toggle_key_label())
+                            .size(14.0)
+                            .color(c.fg_primary),
+                    );
                     ui.label(
                         egui::RichText::new(&self.config.switch_key)
                             .size(15.0)
-                            .color(if self.dark_mode {
-                                egui::Color32::from_rgb(135, 206, 235)
-                            } else {
-                                egui::Color32::from_rgb(0, 100, 200)
-                            })
+                            .color(c.accent_primary)
                             .strong(),
                     );
                 });
@@ -932,11 +846,8 @@ impl SorahkGui {
     /// Renders the global configuration card with application settings.
     fn render_config_card(&self, ui: &mut egui::Ui) {
         let t = &self.translations;
-        let card_bg = if self.dark_mode {
-            egui::Color32::from_rgb(40, 42, 50)
-        } else {
-            egui::Color32::from_rgb(245, 238, 252)
-        };
+        let c = theme::colors(self.dark_mode);
+        let card_bg = c.bg_card_hover;
 
         egui::Frame::NONE
             .fill(card_bg)
@@ -949,75 +860,69 @@ impl SorahkGui {
                     egui::RichText::new(t.config_settings_title())
                         .size(16.0)
                         .strong()
-                        .color(if self.dark_mode {
-                            egui::Color32::from_rgb(200, 180, 255)
-                        } else {
-                            egui::Color32::from_rgb(150, 100, 200)
-                        }),
+                        .color(c.accent_secondary),
                 );
 
                 ui.add_space(8.0);
 
-                let available = ui.available_width();
-                egui::Grid::new("config_grid")
-                    .num_columns(2)
-                    .spacing([30.0, 8.0])
-                    .min_col_width(available * 0.4)
-                    .striped(false)
-                    .show(ui, |ui| {
-                        self.render_config_row(
-                            ui,
-                            t.input_timeout_display(),
-                            &format!("{} ms", self.config.input_timeout),
-                        );
-                        self.render_config_row(
-                            ui,
-                            t.default_interval_display(),
-                            &format!("{} ms", self.config.interval),
-                        );
-                        self.render_config_row(
-                            ui,
-                            t.default_duration_display(),
-                            &format!("{} ms", self.config.event_duration),
-                        );
-                        self.render_bool_row(
-                            ui,
-                            t.show_tray_icon_display(),
-                            self.config.show_tray_icon,
-                        );
-                        self.render_bool_row(
-                            ui,
-                            t.show_notifications_display(),
-                            self.config.show_notifications,
-                        );
-                        self.render_bool_row(
-                            ui,
-                            t.always_on_top_display(),
-                            self.config.always_on_top,
-                        );
-                    });
+                ui.columns(2, |columns| {
+                    egui::Grid::new("config_left_grid")
+                        .num_columns(2)
+                        .spacing([15.0, 8.0])
+                        .show(&mut columns[0], |ui| {
+                            self.render_config_row(
+                                ui,
+                                t.input_timeout_display(),
+                                &format!("{} ms", self.config.input_timeout),
+                            );
+                            self.render_config_row(
+                                ui,
+                                t.default_duration_display(),
+                                &format!("{} ms", self.config.event_duration),
+                            );
+                            self.render_bool_row(
+                                ui,
+                                t.show_notifications_display(),
+                                self.config.show_notifications,
+                            );
+                        });
+
+                    egui::Grid::new("config_right_grid")
+                        .num_columns(2)
+                        .spacing([15.0, 8.0])
+                        .show(&mut columns[1], |ui| {
+                            self.render_config_row(
+                                ui,
+                                t.default_interval_display(),
+                                &format!("{} ms", self.config.interval),
+                            );
+                            self.render_bool_row(
+                                ui,
+                                t.show_tray_icon_display(),
+                                self.config.show_tray_icon,
+                            );
+                            self.render_bool_row(
+                                ui,
+                                t.always_on_top_display(),
+                                self.config.always_on_top,
+                            );
+                        });
+                });
             });
     }
 
     /// Renders a single configuration row with label and value.
     fn render_config_row(&self, ui: &mut egui::Ui, label: &str, value: &str) {
+        let c = theme::colors(self.dark_mode);
         ui.label(
             egui::RichText::new(label)
                 .size(14.0)
-                .color(if self.dark_mode {
-                    egui::Color32::from_rgb(200, 200, 200)
-                } else {
-                    egui::Color32::from_rgb(40, 40, 40)
-                }),
+                .color(c.fg_primary),
         );
         ui.label(
             egui::RichText::new(value)
                 .size(14.0)
-                .color(if self.dark_mode {
-                    egui::Color32::from_rgb(135, 206, 235)
-                } else {
-                    egui::Color32::from_rgb(0, 100, 200)
-                }),
+                .color(c.accent_primary),
         );
         ui.end_row();
     }
@@ -1025,27 +930,14 @@ impl SorahkGui {
     /// Renders a single boolean configuration row with checkmark.
     fn render_bool_row(&self, ui: &mut egui::Ui, label: &str, value: bool) {
         let t = &self.translations;
+        let c = theme::colors(self.dark_mode);
         ui.label(
             egui::RichText::new(label)
                 .size(14.0)
-                .color(if self.dark_mode {
-                    egui::Color32::from_rgb(200, 200, 200)
-                } else {
-                    egui::Color32::from_rgb(40, 40, 40)
-                }),
+                .color(c.fg_primary),
         );
         let text = if value { t.yes() } else { t.no() };
-        let color = if value {
-            if self.dark_mode {
-                egui::Color32::from_rgb(144, 238, 144)
-            } else {
-                egui::Color32::from_rgb(34, 139, 34)
-            }
-        } else if self.dark_mode {
-            egui::Color32::from_rgb(255, 182, 193)
-        } else {
-            egui::Color32::from_rgb(220, 20, 60)
-        };
+        let color = if value { c.accent_success } else { c.accent_pink };
         ui.label(egui::RichText::new(text).size(14.0).color(color));
         ui.end_row();
     }
@@ -1053,11 +945,8 @@ impl SorahkGui {
     /// Renders the key mappings card showing all configured mappings.
     fn render_mappings_card(&self, ui: &mut egui::Ui) {
         let t = &self.translations;
-        let card_bg = if self.dark_mode {
-            egui::Color32::from_rgb(40, 42, 50)
-        } else {
-            egui::Color32::from_rgb(245, 238, 252)
-        };
+        let c = theme::colors(self.dark_mode);
+        let card_bg = c.bg_card_hover;
 
         egui::Frame::NONE
             .fill(card_bg)
@@ -1070,180 +959,384 @@ impl SorahkGui {
                     egui::RichText::new(t.key_mappings_title())
                         .size(16.0)
                         .strong()
-                        .color(if self.dark_mode {
-                            egui::Color32::from_rgb(200, 180, 255)
-                        } else {
-                            egui::Color32::from_rgb(80, 150, 90)
-                        }),
+                        .color(c.accent_secondary),
                 );
-                ui.add_space(5.0);
+                ui.add_space(12.0);
 
+                // Auto-expand height with minimum height
+                let min_height = 30.0;
+                let max_height = 450.0;
                 egui::ScrollArea::vertical()
-                    .max_height(280.0)
+                    .min_scrolled_height(min_height)
+                    .max_height(max_height)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // Customize stripe color for better contrast
-                        let stripe_color = if self.dark_mode {
-                            egui::Color32::from_rgba_premultiplied(50, 52, 60, 100)
-                        } else {
-                            egui::Color32::from_rgba_premultiplied(240, 230, 248, 150)
-                        };
-                        ui.style_mut().visuals.faint_bg_color = stripe_color;
-
-                        let available = ui.available_width();
-                        egui::Grid::new("mappings_grid")
-                            .num_columns(6)
-                            .spacing([15.0, 6.0])
-                            .min_col_width(available * 0.14)
-                            .striped(true)
-                            .show(ui, |ui| {
-                                // Header
-                                self.render_mapping_header(ui);
-
-                                // Mappings
-                                for mapping in &self.config.mappings {
-                                    let trigger_text = &mapping.trigger_key;
-                                    let max_trigger_len = 20;
-                                    let display_trigger = if trigger_text.len() > max_trigger_len {
-                                        format!("{}...", &trigger_text[..max_trigger_len])
-                                    } else {
-                                        trigger_text.clone()
-                                    };
-                                    let trigger_response =
-                                        ui.label(egui::RichText::new(&display_trigger).color(
-                                            if self.dark_mode {
-                                                egui::Color32::from_rgb(255, 200, 100)
-                                            } else {
-                                                egui::Color32::from_rgb(180, 80, 0)
-                                            },
-                                        ));
-                                    if trigger_text.len() > max_trigger_len {
-                                        trigger_response.on_hover_text(trigger_text);
-                                    }
-
-                                    let target_text = mapping.target_keys_display();
-                                    let max_target_len = 35;
-                                    let display_target = if target_text.len() > max_target_len {
-                                        format!("{}...", &target_text[..max_target_len])
-                                    } else {
-                                        target_text.clone()
-                                    };
-                                    let target_response =
-                                        ui.label(egui::RichText::new(&display_target).color(
-                                            if self.dark_mode {
-                                                egui::Color32::from_rgb(100, 200, 255)
-                                            } else {
-                                                egui::Color32::from_rgb(0, 80, 180)
-                                            },
-                                        ));
-                                    if target_text.len() > max_target_len {
-                                        target_response.on_hover_text(&target_text);
-                                    }
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{}",
-                                            mapping.interval.unwrap_or(self.config.interval)
-                                        ))
-                                        .color(
-                                            if self.dark_mode {
-                                                egui::Color32::from_rgb(200, 200, 200)
-                                            } else {
-                                                egui::Color32::from_rgb(60, 60, 60)
-                                            },
-                                        ),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{}",
-                                            mapping
-                                                .event_duration
-                                                .unwrap_or(self.config.event_duration)
-                                        ))
-                                        .color(
-                                            if self.dark_mode {
-                                                egui::Color32::from_rgb(200, 200, 200)
-                                            } else {
-                                                egui::Color32::from_rgb(60, 60, 60)
-                                            },
-                                        ),
-                                    );
-
-                                    // Turbo status
-                                    let (turbo_icon, turbo_color) = if mapping.turbo_enabled {
-                                        (
-                                            "⚡",
-                                            if self.dark_mode {
-                                                egui::Color32::from_rgb(100, 200, 255)
-                                            } else {
-                                                egui::Color32::from_rgb(0, 120, 220)
-                                            },
-                                        )
-                                    } else {
-                                        (
-                                            "○",
-                                            if self.dark_mode {
-                                                egui::Color32::from_rgb(120, 120, 120)
-                                            } else {
-                                                egui::Color32::from_rgb(160, 160, 160)
-                                            },
-                                        )
-                                    };
-                                    ui.label(
-                                        egui::RichText::new(turbo_icon)
-                                            .size(16.0)
-                                            .color(turbo_color),
-                                    );
-
-                                    // Note column
-                                    let note_display = if mapping.note.is_empty() {
-                                        "-".to_string()
-                                    } else if mapping.note.len() > 12 {
-                                        format!("{}...", &mapping.note[..12])
-                                    } else {
-                                        mapping.note.clone()
-                                    };
-                                    let note_response = ui.label(
-                                        egui::RichText::new(&note_display)
-                                            .size(12.0)
-                                            .color(if self.dark_mode {
-                                                egui::Color32::from_rgb(180, 180, 180)
-                                            } else {
-                                                egui::Color32::from_rgb(120, 120, 120)
-                                            }),
-                                    );
-                                    if !mapping.note.is_empty() && mapping.note.len() > 12 {
-                                        note_response.on_hover_text(&mapping.note);
-                                    }
-
-                                    ui.end_row();
-                                }
-                            });
+                        for (idx, mapping) in self.config.mappings.iter().enumerate() {
+                            self.render_mapping_card(ui, mapping, idx);
+                            if idx < self.config.mappings.len() - 1 {
+                                ui.add_space(8.0);
+                            }
+                        }
                     });
             });
     }
 
-    /// Renders the header row for the key mappings table.
-    fn render_mapping_header(&self, ui: &mut egui::Ui) {
+    /// Renders a single mapping as a card.
+    fn render_mapping_card(
+        &self,
+        ui: &mut egui::Ui,
+        mapping: &crate::config::KeyMapping,
+        idx: usize,
+    ) {
         let t = &self.translations;
-        let headers = [
-            t.trigger_header(),
-            t.target_header(),
-            t.interval_header(),
-            t.duration_header(),
-            t.turbo_header(),
-            t.note_label(),
-        ];
-        for header in &headers {
-            ui.label(
-                egui::RichText::new(*header)
-                    .strong()
-                    .color(if self.dark_mode {
-                        egui::Color32::from_rgb(220, 220, 220)
+        let c = theme::colors(self.dark_mode);
+        // Mapping cards sit one elevation step above the list container.
+        // No stroke; fill alone provides visual separation.
+        let card_bg = if self.dark_mode {
+            egui::Color32::from_rgb(60, 62, 75)
+        } else {
+            egui::Color32::from_rgb(255, 253, 255)
+        };
+
+        egui::Frame::NONE
+            .fill(card_bg)
+            .corner_radius(egui::CornerRadius::same(16))
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+
+                // Header row: number, trigger badge, target badge, and turbo
+                let target_mode = mapping.target_mode;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("#{}", idx + 1))
+                            .size(14.0)
+                            .strong()
+                            .color(c.accent_pink),
+                    );
+
+                    ui.add_space(8.0);
+
+                    // Trigger mode badge
+                    let (trigger_badge_text, trigger_badge_bg, trigger_badge_fg) =
+                        if mapping.is_sequence_trigger() {
+                            (t.trigger_mode_sequence_badge(), c.pill_keyboard, c.fg_primary)
+                        } else {
+                            (t.trigger_mode_single_badge(), c.pill_target, c.fg_primary)
+                        };
+
+                    egui::Frame::NONE
+                        .fill(trigger_badge_bg)
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(8, 3))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(trigger_badge_text)
+                                    .size(11.0)
+                                    .strong()
+                                    .color(trigger_badge_fg),
+                            );
+                        });
+
+                    ui.add_space(4.0);
+
+                    // Target mode badge
+                    let (target_badge_text, target_badge_bg, target_badge_fg) = match target_mode {
+                        2 => (t.target_mode_sequence_badge(), c.pill_keyboard, c.fg_primary),
+                        1 => (t.target_mode_multi_badge(), c.pill_target, c.fg_primary),
+                        _ => (t.target_mode_single_badge(), c.pill_target, c.fg_primary),
+                    };
+
+                    egui::Frame::NONE
+                        .fill(target_badge_bg)
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(8, 3))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(target_badge_text)
+                                    .size(11.0)
+                                    .strong()
+                                    .color(target_badge_fg),
+                            );
+                        });
+
+                    // Turbo indicator (right-aligned)
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if mapping.turbo_enabled {
+                            egui::Frame::NONE
+                                .fill(c.accent_warning)
+                                .corner_radius(egui::CornerRadius::same(8))
+                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("⚡").size(13.0).color(
+                                        if self.dark_mode {
+                                            egui::Color32::from_rgb(80, 60, 20)
+                                        } else {
+                                            egui::Color32::from_rgb(100, 80, 20)
+                                        },
+                                    ));
+                                });
+                        }
+                    });
+                });
+
+                ui.add_space(12.0);
+
+                // Trigger section with label
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(t.trigger_short())
+                            .size(13.0)
+                            .color(c.fg_muted),
+                    );
+                });
+
+                ui.add_space(4.0);
+
+                // Trigger content
+                if mapping.is_sequence_trigger() {
+                    // Sequence mode
+                    if let Some(seq_str) = mapping.sequence_string() {
+                        let seq_keys: Vec<&str> = seq_str.split(',').map(|s| s.trim()).collect();
+                        if !seq_keys.is_empty() {
+                            let available_width = ui.available_width();
+                            let sep_width = arrow_separator_width();
+
+                            // Pre-calculate rows for proper wrapping
+                            let mut rows: Vec<Vec<usize>> = Vec::new();
+                            let mut current_row: Vec<usize> = Vec::new();
+                            let mut current_width = 0.0f32;
+
+                            for (key_idx, key) in seq_keys.iter().enumerate() {
+                                let pill_width = estimate_pill_width_display(key);
+                                let s_width = if key_idx < seq_keys.len() - 1 {
+                                    sep_width
+                                } else {
+                                    0.0
+                                };
+                                let total_width = pill_width + s_width;
+                                if current_width + total_width > available_width
+                                    && !current_row.is_empty()
+                                {
+                                    rows.push(std::mem::take(&mut current_row));
+                                    current_width = 0.0;
+                                }
+                                current_row.push(key_idx);
+                                current_width += total_width + 6.0;
+                            }
+                            if !current_row.is_empty() {
+                                rows.push(current_row);
+                            }
+
+                            // Render each row
+                            for row in &rows {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                                    for &key_idx in row {
+                                        let key = seq_keys[key_idx];
+                                        const MAX_LEN: usize = 25;
+                                        let display = if key.len() > MAX_LEN {
+                                            format!("{}...", &key[..MAX_LEN])
+                                        } else {
+                                            key.to_string()
+                                        };
+
+                                        let frame = egui::Frame::NONE
+                                            .fill(c.pill_keyboard)
+                                            .corner_radius(egui::CornerRadius::same(8))
+                                            .inner_margin(egui::Margin::symmetric(8, 4))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(&display)
+                                                        .size(12.0)
+                                                        .strong()
+                                                        .color(c.fg_primary),
+                                                );
+                                            });
+
+                                        if key.len() > MAX_LEN {
+                                            frame.response.on_hover_text(key);
+                                        }
+
+                                        if key_idx < seq_keys.len() - 1 {
+                                            ui.label(
+                                                egui::RichText::new("→")
+                                                    .size(12.0)
+                                                    .color(c.accent_pink),
+                                            );
+                                        }
+                                    }
+                                });
+                                ui.add_space(4.0);
+                            }
+                        }
+                    }
+                } else {
+                    // Single key mode
+                    egui::Frame::NONE
+                        .fill(c.bg_card_hover)
+                        .corner_radius(egui::CornerRadius::same(10))
+                        .inner_margin(egui::Margin::symmetric(12, 6))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(&mapping.trigger_key)
+                                    .size(13.0)
+                                    .strong()
+                                    .color(c.accent_warning),
+                            );
+                        });
+                }
+
+                ui.add_space(10.0);
+
+                // Target section with label
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(t.target_short())
+                            .size(13.0)
+                            .color(c.fg_muted),
+                    );
+                });
+
+                ui.add_space(4.0);
+
+                // Target keys with proper wrapping
+                let target_keys = mapping.get_target_keys();
+                if !target_keys.is_empty() {
+                    let available_width = ui.available_width();
+                    let (sep_char, sep_width) = if target_mode == 2 {
+                        ("→", arrow_separator_width())
+                    } else if target_mode == 1 {
+                        ("+", 20.0)
                     } else {
-                        egui::Color32::from_rgb(40, 40, 40)
-                    }),
-            );
-        }
-        ui.end_row();
+                        ("", 0.0)
+                    };
+
+                    // Pre-calculate rows for proper wrapping
+                    let mut rows: Vec<Vec<usize>> = Vec::new();
+                    let mut current_row: Vec<usize> = Vec::new();
+                    let mut current_width = 0.0f32;
+
+                    for (key_idx, key) in target_keys.iter().enumerate() {
+                        let pill_width = estimate_pill_width_display(key);
+                        let s_width = if key_idx < target_keys.len() - 1 && target_mode != 0 {
+                            sep_width
+                        } else {
+                            0.0
+                        };
+                        let total_width = pill_width + s_width;
+                        if current_width + total_width > available_width && !current_row.is_empty()
+                        {
+                            rows.push(std::mem::take(&mut current_row));
+                            current_width = 0.0;
+                        }
+                        current_row.push(key_idx);
+                        current_width += total_width + 6.0;
+                    }
+                    if !current_row.is_empty() {
+                        rows.push(current_row);
+                    }
+
+                    // Render each row
+                    for row in &rows {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                            for &key_idx in row {
+                                let target = &target_keys[key_idx];
+                                // Sequence mode uses pink pills, Single/Multi use blue pills
+                                let (fill_color, text_color) = if target_mode == 2 {
+                                    (c.pill_keyboard, c.fg_primary)
+                                } else {
+                                    (c.pill_target, c.fg_primary)
+                                };
+
+                                egui::Frame::NONE
+                                    .fill(fill_color)
+                                    .corner_radius(egui::CornerRadius::same(10))
+                                    .inner_margin(egui::Margin::symmetric(10, 5))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(target)
+                                                .size(13.0)
+                                                .color(text_color)
+                                                .strong(),
+                                        );
+                                    });
+
+                                // Separator between keys
+                                if key_idx < target_keys.len() - 1 && !sep_char.is_empty() {
+                                    let sep_color = if target_mode == 2 {
+                                        c.accent_pink
+                                    } else {
+                                        c.accent_primary
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(sep_char).size(13.0).color(sep_color),
+                                    );
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
+                }
+
+                ui.add_space(6.0);
+
+                // Details row with clearer labels
+                ui.horizontal_wrapped(|ui| {
+                    let detail_color = c.fg_muted;
+
+                    let first_target = mapping
+                        .get_target_keys()
+                        .first()
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    let is_mouse_move = is_mouse_move_target(first_target);
+                    let is_mouse_scroll = is_mouse_scroll_target(first_target);
+
+                    // Interval
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "⏱ {} ms",
+                            mapping.interval.unwrap_or(self.config.interval)
+                        ))
+                        .size(11.0)
+                        .color(detail_color),
+                    );
+
+                    // Duration (only for non-move actions)
+                    if !is_mouse_move && !is_mouse_scroll {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "⏳ {} ms",
+                                mapping.event_duration.unwrap_or(self.config.event_duration)
+                            ))
+                            .size(11.0)
+                            .color(detail_color),
+                        );
+                    }
+
+                    // Move speed (only for move/scroll)
+                    if (is_mouse_move || is_mouse_scroll) && mapping.move_speed > 0 {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(format!("🚀 {}", mapping.move_speed))
+                                .size(11.0)
+                                .color(detail_color),
+                        );
+                    }
+
+                    // Sequence window (only for sequences)
+                    if mapping.is_sequence_trigger() {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(format!("⏲ {} ms", mapping.sequence_window_ms))
+                                .size(11.0)
+                                .color(detail_color),
+                        );
+                    }
+                });
+            });
     }
 }
-
